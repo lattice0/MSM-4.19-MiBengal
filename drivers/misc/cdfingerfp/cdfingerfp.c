@@ -16,11 +16,7 @@
 #include <linux/io.h>
 #include <linux/spinlock.h>
 #include <linux/sched.h>
-#ifdef CONFIG_PM_WAKELOCKS
 #include <linux/pm_wakeup.h>
-#else
-#include <linux/wakelock.h>
-#endif
 #include <linux/kthread.h>
 #include <linux/cdev.h>
 #include <linux/fs.h>
@@ -139,7 +135,7 @@ struct cdfingerfp_data {
 	struct regulator *vdd;
 #endif
 	struct fasync_struct *async_queue;
-#ifdef CONFIG_PM_WAKELOCKS
+#ifdef CONFIG_PM_SLEEP
 	struct wakeup_source cdfinger_ws;
 #else
 	struct wake_lock cdfinger_lock;
@@ -362,7 +358,7 @@ static int cdfinger_release(struct inode *inode, struct file *file)
 static void cdfinger_async_report(void)
 {
 	struct cdfingerfp_data *cdfingerfp = g_cdfingerfp_data;
-#ifdef CONFIG_PM_WAKELOCKS
+#ifdef CONFIG_PM_SLEEP
 	__pm_wakeup_event(&cdfingerfp->cdfinger_ws, 1000);
 #else
 	wake_lock_timeout(&cdfingerfp->cdfinger_lock, msecs_to_jiffies(1000));
@@ -393,25 +389,6 @@ static int cdfinger_init_irq(struct cdfingerfp_data *pdata)
 	enable_irq_wake(gpio_to_irq(pdata->irq_num));
 	isInit = 1;
 	return error;
-}
-
-static void cdfinger_wake_lock(struct cdfingerfp_data *pdata, int arg)
-{
-	if (arg) {
-#ifdef CONFIG_PM_WAKELOCKS
-		__pm_stay_awake(&pdata->cdfinger_ws);
-#else
-		wake_lock(&pdata->cdfinger_lock);
-#endif
-	} else {
-#ifdef CONFIG_PM_WAKELOCKS
-		__pm_relax(&pdata->cdfinger_ws);
-		__pm_wakeup_event(&pdata->cdfinger_ws, 3000);
-#else
-		wake_unlock(&pdata->cdfinger_lock);
-		wake_lock_timeout(&pdata->cdfinger_lock, msecs_to_jiffies(3000));
-#endif
-	}
 }
 
 static int cdfinger_report_key(struct cdfingerfp_data *cdfinger, unsigned long arg)
@@ -473,9 +450,6 @@ static long cdfinger_ioctl(struct file *filp, unsigned int cmd, unsigned long ar
 		cdfinger->chip_id = 0x00;
 #endif
 		misc_deregister(cdfinger->miscdev);
-		break;
-	case CDFINGER_WAKE_LOCK:
-		cdfinger_wake_lock(cdfinger, arg);
 		break;
 	case CDFINGER_POWER_ON:
 		err = cdfinger_power_on(cdfinger);
@@ -629,11 +603,7 @@ static int cdfinger_probe(struct platform_device *pdev)
 	}
 	cdfingerdev->miscdev = &st_cdfinger_dev;
 	mutex_init(&cdfingerdev->buf_lock);
-#ifdef CONFIG_PM_WAKELOCKS
-       wakeup_source_init(&cdfingerdev->cdfinger_ws, "cdfinger wakelock");
-#else
-	wake_lock_init(&cdfingerdev->cdfinger_lock, WAKE_LOCK_SUSPEND, "cdfinger wakelock");
-#endif
+       wakeup_source_add(&cdfingerdev->cdfinger_ws);
 	cdfingerdev->cdfinger_input = input_allocate_device();
 	if (!cdfingerdev->cdfinger_input) {
 		CDFINGER_ERR("crate cdfinger_input faile!\n");
@@ -657,11 +627,7 @@ static int cdfinger_probe(struct platform_device *pdev)
 	return 0;
 
 unregister_dev:
-#ifdef CONFIG_PM_WAKELOCKS
-	wakeup_source_trash(&cdfingerdev->cdfinger_ws);
-#else
-	wake_lock_destroy(&cdfingerdev->cdfinger_lock);
-#endif
+	wakeup_source_remove(&cdfingerdev->cdfinger_ws);
 	misc_deregister(&st_cdfinger_dev);
 	kfree(cdfingerdev);
 	return  status;
