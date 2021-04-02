@@ -1610,7 +1610,7 @@ static int wcd937x_event_notify(struct notifier_block *block,
 		snd_soc_component_update_bits(component, WCD937X_AUX_AUXPA,
 					0x80, 0x00);
 		break;
-	case BOLERO_SLV_EVT_SSR_DOWN:
+	case BOLERO_WCD_EVT_SSR_DOWN:
 		wcd937x->mbhc->wcd_mbhc.deinit_in_progress = true;
 		mbhc = &wcd937x->mbhc->wcd_mbhc;
 		wcd937x->usbc_hs_status = get_usbc_hs_status(component,

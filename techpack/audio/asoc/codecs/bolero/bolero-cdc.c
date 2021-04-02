@@ -233,20 +233,19 @@ static int bolero_cdc_update_wcd_event(void *handle, u16 event, u32 data)
 				priv->component,
 				BOLERO_MACRO_EVT_BCS_CLK_OFF, data);
 		break;
-	case SLV_BOLERO_EVT_RX_PA_GAIN_UPDATE:
+	case WCD_BOLERO_EVT_RX_PA_GAIN_UPDATE:
 		if (priv->macro_params[RX_MACRO].event_handler)
 			priv->macro_params[RX_MACRO].event_handler(
 				priv->component,
-				BOLERO_MACRO_EVT_RX_PA_GAIN_UPDATE,
-				data);
+				BOLERO_MACRO_EVT_RX_PA_GAIN_UPDATE, data);
 		break;
-	case SLV_BOLERO_EVT_HPHL_HD2_ENABLE:
+	case WCD_BOLERO_EVT_HPHL_HD2_ENABLE:
 		if (priv->macro_params[RX_MACRO].event_handler)
 			priv->macro_params[RX_MACRO].event_handler(
 				priv->component,
 				BOLERO_MACRO_EVT_HPHL_HD2_ENABLE, data);
 		break;
-	case SLV_BOLERO_EVT_HPHR_HD2_ENABLE:
+	case WCD_BOLERO_EVT_HPHR_HD2_ENABLE:
 		if (priv->macro_params[RX_MACRO].event_handler)
 			priv->macro_params[RX_MACRO].event_handler(
 				priv->component,
@@ -797,10 +796,10 @@ void bolero_wsa_pa_on(struct device *dev, bool adie_lb)
 	}
 	if (adie_lb)
 		bolero_cdc_notifier_call(priv,
-			BOLERO_SLV_EVT_PA_ON_POST_FSCLK_ADIE_LB);
+			BOLERO_WCD_EVT_PA_ON_POST_FSCLK_ADIE_LB);
 	else
 		bolero_cdc_notifier_call(priv,
-			BOLERO_SLV_EVT_PA_ON_POST_FSCLK);
+			BOLERO_WCD_EVT_PA_ON_POST_FSCLK);
 }
 EXPORT_SYMBOL(bolero_wsa_pa_on);
 
@@ -914,7 +913,7 @@ static int bolero_ssr_enable(struct device *dev, void *data)
 			BOLERO_MACRO_EVT_SSR_UP, 0x0);
 	}
 	trace_printk("%s: SSR up events processed by all macros\n", __func__);
-	bolero_cdc_notifier_call(priv, BOLERO_SLV_EVT_SSR_UP);
+	bolero_cdc_notifier_call(priv, BOLERO_WCD_EVT_SSR_UP);
 	return 0;
 }
 
