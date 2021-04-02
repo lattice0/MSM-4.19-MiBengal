@@ -21,7 +21,7 @@
 *.elf
 *.gcno
 *.gz
-*.i
+
 *.ko
 *.lex.c
 *.ll
@@ -136,3 +136,9 @@ all.config
 # fetched Android config fragments
 kernel/configs/android-*.cfg
 
+        AnyKernel/
+        build.sh
+        clang/
+        gcc/
+        gcc32/
+        out/
