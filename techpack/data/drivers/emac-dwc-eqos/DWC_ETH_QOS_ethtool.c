@@ -542,7 +542,8 @@ void DWC_ETH_QOS_configure_flow_ctrl(struct DWC_ETH_QOS_prv_data *pdata)
 void convert_kset_to_legacy_cmd(const struct ethtool_link_ksettings *new_cmd,
 			struct ethtool_cmd *legacy)
 {
-	bool ret = false;
+	bool link_mode = false;
+	//const unsigned long supported = new_cmd->link_modes.supported;
 
 	legacy->autoneg = new_cmd->base.autoneg;
 	legacy->duplex = new_cmd->base.duplex;
@@ -551,25 +552,15 @@ void convert_kset_to_legacy_cmd(const struct ethtool_link_ksettings *new_cmd,
 	legacy->transceiver = new_cmd->base.transceiver;
 	legacy->eth_tp_mdix_ctrl = new_cmd->base.eth_tp_mdix_ctrl;
 
+	legacy->advertising = (__u64)new_cmd->link_modes.advertising;
+	legacy->lp_advertising = (__u64)new_cmd->link_modes.lp_advertising;
+
 	ethtool_cmd_speed_set(legacy, new_cmd->base.speed);
-
-	ret = ethtool_convert_link_mode_to_legacy_u32(&legacy->supported,
+	link_mode = ethtool_convert_link_mode_to_legacy_u32(&legacy->supported,
 				     new_cmd->link_modes.supported);
+	if (!link_mode)
+		DBGPR("unable to convert link mode to legacy \n");
 
-        if (!ret)
-		EMACERR("unable to convert link mode supported to legacy \n");
-
-        ret = ethtool_convert_link_mode_to_legacy_u32(&legacy->advertising,
-				     new_cmd->link_modes.advertising);
-
-        if (!ret)
-		EMACERR("unable to convert link mode advertising to legacy \n");
-
-        ret = ethtool_convert_link_mode_to_legacy_u32(&legacy->lp_advertising,
-				     new_cmd->link_modes.lp_advertising);
-
-        if (!ret)
-		EMACERR("unable to convert link mode lp_advertising to legacy \n");
 	return;
 }
 #endif
