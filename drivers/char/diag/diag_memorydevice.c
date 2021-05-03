@@ -208,7 +208,7 @@ void diag_md_clear_tbl_entries(int id)
 
 int diag_md_write(int id, unsigned char *buf, int len, int ctx)
 {
-	int i, peripheral, pid = 0;
+	int i, peripheral, pid = 0, type = 0;
 	uint8_t found = 0;
 	unsigned long flags, flags_sec;
 	struct diag_md_info *ch = NULL;
@@ -226,6 +226,7 @@ int diag_md_write(int id, unsigned char *buf, int len, int ctx)
 	} else {
 		peripheral = 0;
 	}
+	type = GET_BUF_TYPE(ctx);
 	mutex_lock(&driver->md_session_lock);
 	session_info = diag_md_session_get_peripheral(id, peripheral);
 	if (!session_info) {
@@ -244,7 +245,8 @@ int diag_md_write(int id, unsigned char *buf, int len, int ctx)
 	spin_lock_irqsave(&ch->lock, flags);
 	if (peripheral == APPS_DATA) {
 		spin_lock_irqsave(&driver->diagmem_lock, flags_sec);
-		if (!hdlc_data.allocated && !non_hdlc_data.allocated) {
+		if (type == TYPE_DATA &&
+		!hdlc_data.allocated && !non_hdlc_data.allocated) {
 			spin_unlock_irqrestore(&driver->diagmem_lock,
 				flags_sec);
 			spin_unlock_irqrestore(&ch->lock, flags);
@@ -406,26 +408,38 @@ int diag_md_copy_to_user(char __user *buf, int *pret, size_t buf_size,
 
 			task_s = get_pid_task(pid_struct, PIDTYPE_PID);
 			if (task_s) {
-
-				/* Copy the length of data being passed */
-				err = copy_to_user(buf + ret,
-						(void *)&(entry->len),
-						sizeof(int));
-				if (err) {
-					put_task_struct(task_s);
-					goto drop_data;
+				spin_lock_irqsave(&ch->lock, flags);
+				entry = &ch->tbl[j];
+				if (entry->len <= 0 || entry->buf == NULL) {
+					spin_unlock_irqrestore(&ch->lock,
+						flags);
+					continue;
 				}
-				ret += sizeof(int);
+				spin_unlock_irqrestore(&ch->lock,
+						flags);
+				/* Copy the length of data being passed */
+				if (entry->len) {
+					err = copy_to_user(buf + ret,
+							(void *)&(entry->len),
+							sizeof(int));
+					if (err) {
+						put_task_struct(task_s);
+						goto drop_data;
+					}
+					ret += sizeof(int);
+				}
 
 				/* Copy the actual data being passed */
-				err = copy_to_user(buf + ret,
-						(void *)entry->buf,
-						entry->len);
-				if (err) {
-					put_task_struct(task_s);
-					goto drop_data;
+				if (entry->buf) {
+					err = copy_to_user(buf + ret,
+							(void *)entry->buf,
+							entry->len);
+					if (err) {
+						put_task_struct(task_s);
+						goto drop_data;
+					}
+					ret += entry->len;
 				}
-				ret += entry->len;
 				put_task_struct(task_s);
 			}
 
@@ -437,6 +451,11 @@ int diag_md_copy_to_user(char __user *buf, int *pret, size_t buf_size,
 			num_data++;
 drop_data:
 			spin_lock_irqsave(&ch->lock, flags);
+			entry = &ch->tbl[j];
+			if (entry->len <= 0 || entry->buf == NULL) {
+				spin_unlock_irqrestore(&ch->lock, flags);
+				continue;
+			}
 			if (ch->ops && ch->ops->write_done)
 				ch->ops->write_done(entry->buf, entry->len,
 						    entry->ctx,

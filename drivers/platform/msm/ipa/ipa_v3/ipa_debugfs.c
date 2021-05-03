@@ -322,40 +322,21 @@ static ssize_t ipa3_write_keep_awake(struct file *file, const char __user *buf,
 {
 	s8 option = 0;
 	int ret;
-	uint32_t bw_mbps = 0;
 
 	ret = kstrtos8_from_user(buf, count, 0, &option);
 	if (ret)
 		return ret;
 
-	switch (option) {
-	case 0:
-		IPA_ACTIVE_CLIENTS_DEC_SIMPLE();
-		bw_mbps = 0;
-		break;
-	case 1:
-		IPA_ACTIVE_CLIENTS_INC_SIMPLE();
-		bw_mbps = 0;
-		break;
-	case 2:
-		IPA_ACTIVE_CLIENTS_INC_SIMPLE();
-		bw_mbps = 700;
-		break;
-	case 3:
-		IPA_ACTIVE_CLIENTS_INC_SIMPLE();
-		bw_mbps = 3000;
-		break;
-	case 4:
-		IPA_ACTIVE_CLIENTS_INC_SIMPLE();
-		bw_mbps = 7000;
-		break;
-	default:
-		pr_err("Not support this vote (%d)\n", option);
-		return -EFAULT;
-	}
-	if (ipa3_vote_for_bus_bw(&bw_mbps)) {
-		IPAERR("Failed to vote for bus BW (%u)\n", bw_mbps);
-		return -EFAULT;
+	if (option == 0) {
+		if (ipa_pm_remove_dummy_clients()) {
+			pr_err("Failed to remove dummy clients\n");
+			return -EFAULT;
+		}
+	} else {
+		if (ipa_pm_add_dummy_clients(option - 1)) {
+			pr_err("Failed to add dummy clients\n");
+			return -EFAULT;
+		}
 	}
 
 	return count;
@@ -1502,9 +1483,9 @@ static ssize_t ipa3_read_ntn(struct file *file, char __user *ubuf,
 		size_t count, loff_t *ppos)
 {
 #define TX_STATS(y) \
-	ipa3_ctx->uc_ntn_ctx.ntn_uc_stats_mmio->tx_ch_stats[0].y
+	stats.tx_ch_stats[0].y
 #define RX_STATS(y) \
-	ipa3_ctx->uc_ntn_ctx.ntn_uc_stats_mmio->rx_ch_stats[0].y
+	stats.rx_ch_stats[0].y
 
 	struct Ipa3HwStatsNTNInfoData_t stats;
 	int nbytes;
@@ -2963,6 +2944,15 @@ struct dentry *ipa_debugfs_get_root(void)
 EXPORT_SYMBOL(ipa_debugfs_get_root);
 
 #else /* !CONFIG_DEBUG_FS */
+#define INVALID_NO_OF_CHAR (-1)
 void ipa3_debugfs_init(void) {}
 void ipa3_debugfs_remove(void) {}
+int _ipa_read_ep_reg_v3_0(char *buf, int max_len, int pipe)
+{
+	return INVALID_NO_OF_CHAR;
+}
+int _ipa_read_ep_reg_v4_0(char *buf, int max_len, int pipe)
+{
+	return INVALID_NO_OF_CHAR;
+}
 #endif

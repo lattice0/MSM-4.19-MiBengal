@@ -35,7 +35,6 @@
 #include <linux/iommu.h>
 #include <linux/sort.h>
 #include <linux/msm_dma_iommu_mapping.h>
-#include <asm/dma-iommu.h>
 #include "adsprpc_compat.h"
 #include "adsprpc_shared.h"
 #include <soc/qcom/ramdump.h>
@@ -75,6 +74,9 @@
 #define SENSORS_PDR_SLPI_SERVICE_LOCATION_CLIENT_NAME "sensors_pdr_sdsprpc"
 #define SENSORS_PDR_SLPI_SERVICE_NAME            SENSORS_PDR_ADSP_SERVICE_NAME
 #define SLPI_SENSORPD_NAME                       "msm/slpi/sensor_pd"
+
+#define FASTRPC_SECURE_WAKE_SOURCE_CLIENT_NAME		"adsprpc-secure"
+#define FASTRPC_NON_SECURE_WAKE_SOURCE_CLIENT_NAME	"adsprpc-non_secure"
 
 #define RPC_TIMEOUT	(5 * HZ)
 #define BALIGN		128
@@ -149,10 +151,10 @@
 
 #define PERF(enb, cnt, ff) \
 	{\
-		struct timespec startT = {0};\
+		struct timespec64 startT = {0};\
 		int64_t *counter = cnt;\
 		if (enb && counter) {\
-			getnstimeofday(&startT);\
+			ktime_get_real_ts64(&startT);\
 		} \
 		ff ;\
 		if (enb && counter) {\
@@ -357,6 +359,8 @@ struct fastrpc_channel_ctx {
 	void *rh_dump_dev;
 	/* Indicates, if channel is restricted to secure node only */
 	int secure;
+	/* Indicates whether the channel supports unsigned PD */
+	bool unsigned_support;
 	struct fastrpc_dsp_capabilities dsp_cap_kernel;
 	void *ipc_log_ctx;
 	/* cpu capabilities shared to DSP */
@@ -383,6 +387,11 @@ struct fastrpc_apps {
 	bool legacy_remote_heap;
 	/* Unique job id for each message */
 	uint64_t jobid[NUM_CHANNELS];
+	struct device *secure_dev;
+	struct device *non_secure_dev;
+	/* Secure subsystems like ADSP/SLPI will use secure client */
+	struct wakeup_source *wake_source_secure;
+	/* Non-secure subsystem like CDSP will use regular client */
 	struct wakeup_source *wake_source;
 	struct qos_cores silvercores;
 	uint32_t max_size_limit;
@@ -469,7 +478,6 @@ struct fastrpc_file {
 	char *debug_buf;
 	/* Flag to enable PM wake/relax voting for every remote invoke */
 	int wake_enable;
-	struct wakeup_source *wake_source;
 	uint32_t ws_timeout;
 };
 
@@ -543,16 +551,16 @@ static struct fastrpc_channel_ctx gcinfo[NUM_CHANNELS] = {
 static int hlosvm[1] = {VMID_HLOS};
 static int hlosvmperm[1] = {PERM_READ | PERM_WRITE | PERM_EXEC};
 
-static void fastrpc_pm_awake(struct fastrpc_file *fl);
+static void fastrpc_pm_awake(struct fastrpc_file *fl, int channel_type);
 
-static inline int64_t getnstimediff(struct timespec *start)
+static inline int64_t getnstimediff(struct timespec64 *start)
 {
 	int64_t ns;
-	struct timespec ts, b;
+	struct timespec64 ts, b;
 
-	getnstimeofday(&ts);
-	b = timespec_sub(ts, *start);
-	ns = timespec_to_ns(&b);
+	ktime_get_real_ts64(&ts);
+	b = timespec64_sub(ts, *start);
+	ns = timespec64_to_ns(&b);
 	return ns;
 }
 
@@ -1106,6 +1114,14 @@ static int fastrpc_mmap_create(struct fastrpc_file *fl, int fd,
 			goto bail;
 		}
 
+		VERIFY(err, map->size >= len && map->size < me->max_size_limit);
+		if (err) {
+			err = -EFAULT;
+			pr_err("adsprpc: %s: invalid map size 0x%zx len 0x%zx\n",
+				__func__, map->size, len);
+			goto bail;
+		}
+
 		vmid = fl->apps->channel[fl->cid].vmid;
 		if (!sess->smmu.enabled && !vmid) {
 			VERIFY(err, map->phys >= me->range.addr &&
@@ -1502,7 +1518,7 @@ static void context_free(struct smq_invoke_ctx *ctx)
 static void context_notify_user(struct smq_invoke_ctx *ctx,
 		int retval, uint32_t rspFlags, uint32_t earlyWakeTime)
 {
-	fastrpc_pm_awake(ctx->fl);
+	fastrpc_pm_awake(ctx->fl, gcinfo[ctx->fl->cid].secure);
 	ctx->retval = retval;
 	switch (rspFlags) {
 	case NORMAL_RESPONSE:
@@ -1957,15 +1973,13 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 					ctx->overps[oix]->mstart,
 					rpra[i].buf.len, map->size);
 				}
-			} else
-				dmac_flush_range(uint64_to_ptr(rpra[i].buf.pv),
-					uint64_to_ptr(rpra[i].buf.pv
-						+ rpra[i].buf.len));
+			}
 		}
 	}
 	PERF_END);
 	for (i = bufs; rpra && i < bufs + handles; i++) {
-		rpra[i].dma.fd = ctx->fds[i];
+		if (ctx->fds)
+			rpra[i].dma.fd = ctx->fds[i];
 		rpra[i].dma.len = (uint32_t)lpra[i].buf.len;
 		rpra[i].dma.offset = (uint32_t)(uintptr_t)lpra[i].buf.pv;
 	}
@@ -2116,11 +2130,8 @@ static void inv_args(struct smq_invoke_ctx *ctx)
 					offset, ctx->overps[i]->mend,
 					ctx->overps[i]->mstart,
 					rpra[over].buf.len, map->size);
+				}
 			}
-		} else
-			dmac_inv_range((char *)uint64_to_ptr(rpra[over].buf.pv),
-				(char *)uint64_to_ptr(rpra[over].buf.pv
-						 + rpra[over].buf.len));
 		}
 	}
 bail:
@@ -2134,6 +2145,14 @@ static int fastrpc_invoke_send(struct smq_invoke_ctx *ctx,
 	struct fastrpc_file *fl = ctx->fl;
 	struct fastrpc_channel_ctx *channel_ctx = NULL;
 	int err = 0, cid = -1;
+
+	channel_ctx = &fl->apps->channel[fl->cid];
+	cid = fl->cid;
+	VERIFY(err, cid >= ADSP_DOMAIN_ID && cid < NUM_CHANNELS);
+	if (err) {
+		err = -ECHRNG;
+		goto bail;
+	}
 
 	cid = fl->cid;
 	VERIFY(err, cid >= ADSP_DOMAIN_ID && cid < NUM_CHANNELS);
@@ -2196,23 +2215,33 @@ static void fastrpc_init(struct fastrpc_apps *me)
 		me->channel[i].sesscount = 0;
 		/* All channels are secure by default except CDSP */
 		me->channel[i].secure = SECURE_CHANNEL;
+		me->channel[i].unsigned_support = false;
 		mutex_init(&me->channel[i].smd_mutex);
 		mutex_init(&me->channel[i].rpmsg_mutex);
 		spin_lock_init(&me->channel[i].ctxlock);
 	}
 	/* Set CDSP channel to non secure */
 	me->channel[CDSP_DOMAIN_ID].secure = NON_SECURE_CHANNEL;
+	/* Set CDSP channel unsigned_support to true*/
+	me->channel[CDSP_DOMAIN_ID].unsigned_support = true;
 }
 
-static inline void fastrpc_pm_awake(struct fastrpc_file *fl)
+static inline void fastrpc_pm_awake(struct fastrpc_file *fl, int channel_type)
 {
-	if (!fl->wake_enable || !fl->wake_source)
-		return;
+	struct fastrpc_apps *me = &gfa;
+	struct wakeup_source *wake_source = NULL;
+
 	/*
 	 * Vote with PM to abort any suspend in progress and
 	 * keep system awake for specified timeout
 	 */
-	pm_wakeup_ws_event(fl->wake_source, fl->ws_timeout, true);
+	if (channel_type == SECURE_CHANNEL)
+		wake_source = me->wake_source_secure;
+	else if (channel_type == NON_SECURE_CHANNEL)
+		wake_source = me->wake_source;
+
+	if (wake_source)
+		pm_wakeup_ws_event(wake_source, fl->ws_timeout, true);
 }
 
 static inline int fastrpc_wait_for_response(struct smq_invoke_ctx *ctx,
@@ -2308,7 +2337,7 @@ static void fastrpc_wait_for_completion(struct smq_invoke_ctx *ctx,
 }
 
 static void fastrpc_update_invoke_count(uint32_t handle, int64_t *perf_counter,
-					struct timespec *invoket)
+					struct timespec64 *invoket)
 {
 	/* update invoke count for dynamic handles */
 	if (handle != FASTRPC_STATIC_HANDLE_LISTENER) {
@@ -2332,7 +2361,7 @@ static int fastrpc_internal_invoke(struct fastrpc_file *fl, uint32_t mode,
 	struct smq_invoke_ctx *ctx = NULL;
 	struct fastrpc_ioctl_invoke *invoke = &inv->inv;
 	int err = 0, interrupted = 0, cid = -1;
-	struct timespec invoket = {0};
+	struct timespec64 invoket = {0};
 	int64_t *perf_counter = NULL;
 
 	cid = fl->cid;
@@ -2350,7 +2379,7 @@ static int fastrpc_internal_invoke(struct fastrpc_file *fl, uint32_t mode,
 	}
 	if (fl->profile) {
 		perf_counter = getperfcounter(fl, PERF_COUNT);
-		getnstimeofday(&invoket);
+		ktime_get_real_ts64(&invoket);
 	}
 
 	if (!kernel) {
@@ -2420,13 +2449,13 @@ static int fastrpc_internal_invoke(struct fastrpc_file *fl, uint32_t mode,
 	inv_args(ctx);
 	PERF_END);
 
-	VERIFY(err, 0 == (err = ctx->retval));
+	PERF(fl->profile, GET_COUNTER(perf_counter, PERF_PUTARGS),
+	VERIFY(err, 0 == (err = put_args(kernel, ctx, invoke->pra)));
+	PERF_END);
 	if (err)
 		goto bail;
 
-	PERF(fl->profile, GET_COUNTER(perf_counter, PERF_PUTARGS),
-	VERIFY(err, 0 == put_args(kernel, ctx, invoke->pra));
-	PERF_END);
+	VERIFY(err, 0 == (err = ctx->retval));
 	if (err)
 		goto bail;
  bail:
@@ -2487,6 +2516,20 @@ static int fastrpc_init_process(struct fastrpc_file *fl,
 	struct fastrpc_buf *imem = NULL;
 	unsigned long imem_dma_attr = 0;
 	char *proc_name = NULL;
+	int unsigned_request = (uproc->attrs & FASTRPC_MODE_UNSIGNED_MODULE);
+	int cid = fl->cid;
+	struct fastrpc_channel_ctx *chan = &me->channel[cid];
+
+	if (chan->unsigned_support &&
+		fl->dev_minor == MINOR_NUM_DEV) {
+		/* Make sure third party applications */
+		/* can spawn only unsigned PD when */
+		/* channel configured as secure. */
+		if (chan->secure && !unsigned_request) {
+			err = -ECONNREFUSED;
+			goto bail;
+		}
+	}
 
 	VERIFY(err, 0 == (err = fastrpc_channel_open(fl)));
 	if (err)
@@ -3191,8 +3234,7 @@ static int fastrpc_mmap_remove_pdr(struct fastrpc_file *fl)
 	VERIFY(err, cid == fl->cid);
 	if (err)
 		goto bail;
-	if (!me->channel[fl->cid].spd[session].ispdup &&
-		me->channel[fl->cid].spd[session].pdrhandle) {
+	if (!me->channel[fl->cid].spd[session].ispdup) {
 		err = -ENOTCONN;
 		goto bail;
 	}
@@ -3279,8 +3321,13 @@ static int fastrpc_internal_munmap(struct fastrpc_file *fl,
 	mutex_unlock(&fl->map_mutex);
 	if (err)
 		goto bail;
+	VERIFY(err, map != NULL);
+	if (err) {
+		err = -EINVAL;
+		goto bail;
+	}
 	VERIFY(err, !fastrpc_munmap_on_dsp(fl, map->raddr,
-				map->phys, map->size, map->flags));
+			map->phys, map->size, map->flags));
 	if (err)
 		goto bail;
 	mutex_lock(&fl->map_mutex);
@@ -3646,8 +3693,6 @@ static int fastrpc_file_free(struct fastrpc_file *fl)
 	spin_lock(&fl->apps->hlock);
 	hlist_del_init(&fl->hn);
 	spin_unlock(&fl->apps->hlock);
-	if (fl->wake_source)
-		wakeup_source_unregister(fl->wake_source);
 	kfree(fl->debug_buf);
 
 	if (!fl->sctx) {
@@ -3997,14 +4042,26 @@ bail:
 	return err;
 }
 
+static inline void fastrpc_register_wakeup_source(struct device *dev,
+	const char *client_name, struct wakeup_source **device_wake_source)
+{
+	struct wakeup_source *wake_source = NULL;
+
+	wake_source = wakeup_source_register(dev, client_name);
+	if (IS_ERR_OR_NULL(wake_source)) {
+		pr_err("adsprpc: Error: %s: %s: wakeup_source_register failed for dev %s, client %s with err %ld\n",
+		       __func__, current->comm, dev_name(dev),
+		       client_name, PTR_ERR(wake_source));
+		return;
+	}
+	*device_wake_source = wake_source;
+}
+
 static int fastrpc_device_open(struct inode *inode, struct file *filp)
 {
 	int err = 0;
-	struct dentry *debugfs_file;
 	struct fastrpc_file *fl = NULL;
 	struct fastrpc_apps *me = &gfa;
-	char strpid[PID_SIZE];
-	int buf_size = 0;
 
 	/*
 	 * Indicates the device node opened
@@ -4023,23 +4080,6 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 	if (err)
 		return err;
 
-	snprintf(strpid, PID_SIZE, "%d", current->pid);
-	buf_size = strlen(current->comm) + strlen("_") + strlen(strpid) + 1;
-	VERIFY(err, NULL != (fl->debug_buf = kzalloc(buf_size, GFP_KERNEL)));
-	if (err) {
-		kfree(fl);
-		return err;
-	}
-	snprintf(fl->debug_buf, UL_SIZE, "%.10s%s%d",
-			current->comm, "_", current->pid);
-	debugfs_file = debugfs_create_file(fl->debug_buf, 0644, debugfs_root,
-						fl, &debugfs_fops);
-
-	fl->wake_source = wakeup_source_register(fl->debug_buf);
-	if (IS_ERR_OR_NULL(fl->wake_source)) {
-		pr_err("adsprpc: Error: %s: %s: wakeup_source_register failed with err %ld\n",
-			current->comm, __func__, PTR_ERR(fl->wake_source));
-	}
 	context_list_ctor(&fl->clst);
 	spin_lock_init(&fl->hlock);
 	INIT_HLIST_HEAD(&fl->maps);
@@ -4048,14 +4088,11 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 	INIT_HLIST_HEAD(&fl->remote_bufs);
 	INIT_HLIST_NODE(&fl->hn);
 	fl->sessionid = 0;
-	fl->tgid = current->tgid;
 	fl->apps = me;
 	fl->mode = FASTRPC_MODE_SERIAL;
 	fl->cid = -1;
 	fl->dev_minor = dev_minor;
 	fl->init_mem = NULL;
-	if (debugfs_file != NULL)
-		fl->debugfs_file = debugfs_file;
 	memset(&fl->perf, 0, sizeof(fl->perf));
 	fl->qos_request = 0;
 	fl->dsp_proc_init = 0;
@@ -4069,29 +4106,63 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 	return 0;
 }
 
+static int fastrpc_set_process_info(struct fastrpc_file *fl)
+{
+	int err = 0, buf_size = 0;
+	char strpid[PID_SIZE];
+
+	fl->tgid = current->tgid;
+	snprintf(strpid, PID_SIZE, "%d", current->pid);
+	if (debugfs_root) {
+		buf_size = strlen(current->comm) + strlen("_")
+			+ strlen(strpid) + 1;
+		fl->debug_buf = kzalloc(buf_size, GFP_KERNEL);
+		if (!fl->debug_buf) {
+			err = -ENOMEM;
+			return err;
+		}
+		snprintf(fl->debug_buf, UL_SIZE, "%.10s%s%d",
+			current->comm, "_", current->pid);
+		fl->debugfs_file = debugfs_create_file(fl->debug_buf, 0644,
+			debugfs_root, fl, &debugfs_fops);
+		if (IS_ERR_OR_NULL(fl->debugfs_file)) {
+			pr_warn("Error: %s: %s: failed to create debugfs file %s\n",
+				current->comm, __func__, fl->debug_buf);
+			fl->debugfs_file = NULL;
+			kfree(fl->debug_buf);
+			fl->debug_buf = NULL;
+		}
+	}
+	return err;
+}
+
 static int fastrpc_get_info(struct fastrpc_file *fl, uint32_t *info)
 {
 	int err = 0;
 	uint32_t cid;
+	struct fastrpc_apps *me = &gfa;
 
 	VERIFY(err, fl != NULL);
 	if (err)
 		goto bail;
+	err = fastrpc_set_process_info(fl);
+	if (err)
+		goto bail;
 	if (fl->cid == -1) {
-		cid = *info;
+		struct fastrpc_channel_ctx *chan = &me->channel[cid];
 		VERIFY(err, cid < NUM_CHANNELS);
 		if (err)
 			goto bail;
 		/* Check to see if the device node is non-secure */
 		if (fl->dev_minor == MINOR_NUM_DEV) {
 			/*
-			 * For non secure device node check and make sure that
-			 * the channel allows non-secure access
-			 * If not, bail. Session will not start.
-			 * cid will remain -1 and client will not be able to
-			 * invoke any other methods without failure
+			 * If an app is trying to offload to a secure remote
+			 * channel by opening the non-secure device node, allow
+			 * the access if the subsystem supports unsigned
+			 * offload. Untrusted apps will be restricted.
 			 */
-			if (fl->apps->channel[cid].secure == SECURE_CHANNEL) {
+			if (chan->secure == SECURE_CHANNEL &&
+				!chan->unsigned_support) {
 				err = -EACCES;
 				goto bail;
 			}
@@ -4174,7 +4245,10 @@ static int fastrpc_internal_control(struct fastrpc_file *fl,
 			fl->ws_timeout = MAX_PM_TIMEOUT_MS;
 		else
 			fl->ws_timeout = cp->pm.timeout;
-		fastrpc_pm_awake(fl);
+		fastrpc_pm_awake(fl, gcinfo[fl->cid].secure);
+		break;
+	case FASTRPC_CONTROL_DSPPROCESS_CLEAN:
+		(void)fastrpc_release_current_dsp_process(fl);
 		break;
 	default:
 		err = -EBADRQC;
@@ -4736,8 +4810,15 @@ static int fastrpc_cb_probe(struct device *dev)
 	}
 
 	chan->sesscount++;
-	debugfs_global_file = debugfs_create_file("global", 0644, debugfs_root,
-							NULL, &debugfs_fops);
+	if (debugfs_root) {
+		debugfs_global_file = debugfs_create_file("global", 0644,
+			debugfs_root, NULL, &debugfs_fops);
+		if (IS_ERR_OR_NULL(debugfs_global_file)) {
+			pr_warn("Error: %s: %s: failed to create debugfs global file\n",
+				current->comm, __func__);
+			debugfs_global_file = NULL;
+		}
+	}
 bail:
 	return err;
 }
@@ -5046,6 +5127,12 @@ static int __init fastrpc_device_init(void)
 	int err = 0, i;
 
 	debugfs_root = debugfs_create_dir("adsprpc", NULL);
+	if (IS_ERR_OR_NULL(debugfs_root)) {
+		pr_warn("Error: %s: %s: failed to create debugfs root dir\n",
+			current->comm, __func__);
+		debugfs_remove_recursive(debugfs_root);
+		debugfs_root = NULL;
+	}
 	memset(me, 0, sizeof(*me));
 	fastrpc_init(me);
 	me->dev = NULL;
@@ -5054,7 +5141,7 @@ static int __init fastrpc_device_init(void)
 	if (err)
 		goto register_bail;
 	VERIFY(err, 0 == alloc_chrdev_region(&me->dev_no, 0, NUM_CHANNELS,
-					DEVICE_NAME));
+		DEVICE_NAME));
 	if (err)
 		goto alloc_chrdev_bail;
 	cdev_init(&me->cdev, &fops);
@@ -5119,13 +5206,13 @@ static int __init fastrpc_device_init(void)
 	}
 	me->rpmsg_register = 1;
 
-	me->wake_source = wakeup_source_register("adsprpc");
-	VERIFY(err, !IS_ERR_OR_NULL(me->wake_source));
-	if (err) {
-		pr_err("adsprpc: Error: %s: wakeup_source_register failed with err %d\n",
-					__func__, PTR_ERR(me->wake_source));
-		goto device_create_bail;
-	}
+	fastrpc_register_wakeup_source(me->non_secure_dev,
+				       FASTRPC_NON_SECURE_WAKE_SOURCE_CLIENT_NAME,
+				       &me->wake_source);
+	fastrpc_register_wakeup_source(me->secure_dev,
+				       FASTRPC_SECURE_WAKE_SOURCE_CLIENT_NAME,
+				       &me->wake_source_secure);
+
 	return 0;
 device_create_bail:
 	for (i = 0; i < NUM_CHANNELS; i++) {
@@ -5178,6 +5265,8 @@ static void __exit fastrpc_device_exit(void)
 		unregister_rpmsg_driver(&fastrpc_rpmsg_client);
 	if (me->wake_source)
 		wakeup_source_unregister(me->wake_source);
+	if (me->wake_source_secure)
+		wakeup_source_unregister(me->wake_source_secure);
 	debugfs_remove_recursive(debugfs_root);
 }
 

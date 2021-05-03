@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2011-2020, The Linux Foundation. All rights reserved.
- * Copyright (C) 2020 XiaoMi, Inc.
  */
 
 #include <linux/compat.h>
@@ -136,8 +135,10 @@ static int kgsl_iommu_map_globals(struct kgsl_pagetable *pagetable)
 			int ret = kgsl_mmu_map(pagetable,
 					global_pt_entries[i].memdesc);
 
-			if (ret)
+			if (ret) {
+				kgsl_iommu_unmap_globals(pagetable);
 				return ret;
+			}
 		}
 	}
 
@@ -756,6 +757,7 @@ static int kgsl_iommu_fault_handler(struct iommu_domain *domain,
 	unsigned int no_page_fault_log = 0;
 	char *fault_type = "unknown";
 	char *comm = "unknown";
+	bool fault_ret_flag = false;
 	struct kgsl_process_private *private;
 
 	static DEFINE_RATELIMIT_STATE(_rs,
@@ -799,9 +801,11 @@ static int kgsl_iommu_fault_handler(struct iommu_domain *domain,
 		 * Turn off GPU IRQ so we don't get faults from it too.
 		 * The device mutex must be held to change power state
 		 */
-		mutex_lock(&device->mutex);
-		kgsl_pwrctrl_change_state(device, KGSL_STATE_AWARE);
-		mutex_unlock(&device->mutex);
+		if (mutex_trylock(&device->mutex)) {
+			kgsl_pwrctrl_change_state(device, KGSL_STATE_AWARE);
+			mutex_unlock(&device->mutex);
+		} else
+			fault_ret_flag = true;
 	}
 
 	contextidr = KGSL_IOMMU_GET_CTX_REG(ctx, CONTEXTIDR);
@@ -861,13 +865,12 @@ static int kgsl_iommu_fault_handler(struct iommu_domain *domain,
 		}
 	}
 
-
 	/*
 	 * We do not want the h/w to resume fetching data from an iommu
 	 * that has faulted, this is better for debugging as it will stall
 	 * the GPU and trigger a snapshot. Return EBUSY error.
 	 */
-	if (test_bit(KGSL_FT_PAGEFAULT_GPUHALT_ENABLE,
+	if (!fault_ret_flag && test_bit(KGSL_FT_PAGEFAULT_GPUHALT_ENABLE,
 		&adreno_dev->ft_pf_policy) &&
 		(flags & IOMMU_FAULT_TRANSACTION_STALLED)) {
 		uint32_t sctlr_val;
@@ -1012,6 +1015,8 @@ static void kgsl_iommu_destroy_pagetable(struct kgsl_pagetable *pt)
 	} else {
 		ctx = &iommu->ctx[KGSL_IOMMU_CONTEXT_USER];
 		kgsl_iommu_unmap_globals(pt);
+		if (pt->name == KGSL_MMU_GLOBAL_PT)
+			mmu->globalpt_mapped = false;
 	}
 
 	if (iommu_pt->domain) {
@@ -1204,8 +1209,8 @@ static int _init_global_pt(struct kgsl_mmu *mmu, struct kgsl_pagetable *pt)
 		goto done;
 	}
 
-	if (!MMU_FEATURE(mmu, KGSL_MMU_GLOBAL_PAGETABLE) &&
-		scm_is_call_available(SCM_SVC_MP, CP_SMMU_APERTURE_ID)) {
+	if (kgsl_mmu_is_perprocess(mmu) && MMU_FEATURE(mmu,
+				KGSL_MMU_SMMU_APERTURE)) {
 		struct scm_desc desc = {0};
 
 		desc.args[0] = 0xFFFF0000 | ((CP_APERTURE_REG & 0xff) << 8) |
@@ -1223,7 +1228,7 @@ static int _init_global_pt(struct kgsl_mmu *mmu, struct kgsl_pagetable *pt)
 			dev_err(device->dev,
 				"SMMU aperture programming call failed with error %d\n",
 				ret);
-			return ret;
+			goto done;
 		}
 	}
 
@@ -1244,8 +1249,6 @@ static int _init_global_pt(struct kgsl_mmu *mmu, struct kgsl_pagetable *pt)
 			ret);
 		goto done;
 	}
-
-	ret = kgsl_iommu_map_globals(pt);
 
 done:
 	if (ret)
@@ -1530,6 +1533,18 @@ static int kgsl_iommu_init(struct kgsl_mmu *mmu)
 	kgsl_setup_qdss_desc(device);
 	kgsl_setup_qtimer_desc(device);
 
+	mmu->defaultpagetable = kgsl_mmu_getpagetable(mmu,
+				KGSL_MMU_GLOBAL_PT);
+	/* if we don't have a default pagetable, nothing will work */
+	if (IS_ERR(mmu->defaultpagetable)) {
+		status = PTR_ERR(mmu->defaultpagetable);
+		mmu->defaultpagetable = NULL;
+		goto done;
+	} else if (mmu->defaultpagetable == NULL) {
+		status = -ENOMEM;
+		goto done;
+	}
+
 	if (!mmu->secured)
 		goto done;
 
@@ -1559,18 +1574,8 @@ static int _setup_user_context(struct kgsl_mmu *mmu)
 	struct kgsl_iommu_pt *iommu_pt = NULL;
 	unsigned int  sctlr_val;
 
-	if (mmu->defaultpagetable == NULL) {
-		mmu->defaultpagetable = kgsl_mmu_getpagetable(mmu,
-				KGSL_MMU_GLOBAL_PT);
-		/* if we don't have a default pagetable, nothing will work */
-		if (IS_ERR(mmu->defaultpagetable)) {
-			ret = PTR_ERR(mmu->defaultpagetable);
-			mmu->defaultpagetable = NULL;
-			return ret;
-		} else if (mmu->defaultpagetable == NULL) {
-			return -ENOMEM;
-		}
-	}
+	if (mmu->defaultpagetable == NULL)
+		return -ENOMEM;
 
 	iommu_pt = mmu->defaultpagetable->priv;
 	if (iommu_pt == NULL)
@@ -1677,6 +1682,14 @@ static int kgsl_iommu_start(struct kgsl_mmu *mmu)
 
 		/* make sure register write committed */
 		wmb();
+	}
+
+	if (mmu->defaultpagetable != NULL && !mmu->globalpt_mapped) {
+		status = kgsl_iommu_map_globals(mmu->defaultpagetable);
+		if (status)
+			return status;
+
+		mmu->globalpt_mapped = true;
 	}
 
 	/* Make sure the hardware is programmed to the default pagetable */

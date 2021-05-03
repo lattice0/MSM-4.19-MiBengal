@@ -2029,6 +2029,9 @@ static bool tcp_can_coalesce_send_queue_head(struct sock *sk, int len)
 	struct sk_buff *skb, *next;
 
 	skb = tcp_send_head(sk);
+	if (!skb)
+		return false;
+
 	tcp_for_write_queue_from_safe(skb, next, sk) {
 		if (len <= skb->len)
 			break;
@@ -3165,6 +3168,7 @@ int tcp_send_synack(struct sock *sk)
 			if (!nskb)
 				return -ENOMEM;
 			INIT_LIST_HEAD(&nskb->tcp_tsorted_anchor);
+			tcp_highest_sack_replace(sk, skb, nskb);
 			tcp_rtx_queue_unlink_and_free(skb, sk);
 			__skb_header_release(nskb);
 			tcp_rbtree_insert(&sk->tcp_rtx_queue, nskb);

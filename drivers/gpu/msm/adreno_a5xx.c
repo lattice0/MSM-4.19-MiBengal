@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2014-2020, The Linux Foundation. All rights reserved.
- * Copyright (C) 2020 XiaoMi, Inc.
  */
 
 #include <linux/clk/qcom.h>
@@ -149,6 +148,9 @@ static void a5xx_platform_setup(struct adreno_device *adreno_dev)
 
 	/* Set the GPU busy counter to use for frequency scaling */
 	adreno_dev->perfctr_pwr_lo = A5XX_RBBM_PERFCTR_RBBM_0_LO;
+
+	if (ADRENO_FEATURE(adreno_dev, ADRENO_SPTP_PC))
+		set_bit(ADRENO_SPTP_PC_CTRL, &adreno_dev->pwrctrl_flag);
 
 	/* Check efuse bits for various capabilties */
 	a5xx_check_features(adreno_dev);
@@ -351,12 +353,15 @@ static void a5xx_protect_init(struct adreno_device *adreno_dev)
 	/*
 	 * For a530 and a540 the SMMU region is 0x20000 bytes long and 0x10000
 	 * bytes on all other targets. The base offset for both is 0x40000.
-	 * Write it to the next available slot
+	 * Write it to the next available slot. The base offset and length of a
+	 * block must be specified as power of 2 values.
 	 */
 	if (adreno_is_a530(adreno_dev) || adreno_is_a540(adreno_dev))
-		_setprotectreg(device, reg + 1, 0x40000, ilog2(0x20000));
+		_setprotectreg(device, reg + 1, (0x40000 >> 2),
+			ilog2(0x20000 >> 2));
 	else
-		_setprotectreg(device, reg + 1, 0x40000, ilog2(0x10000));
+		_setprotectreg(device, reg + 1, (0x40000 >> 2),
+			ilog2(0x10000 >> 2));
 }
 
 /*
