@@ -7,7 +7,7 @@ git clone https://github.com/2e-dev/AnyKernel3.git  --depth=1 AnyKernel
 
 echo "Done"
 KERNEL_DIR=$(pwd)
-IMAGE="${KERNEL_DIR}/out/arch/arm64/boot/Image.gz-dtb"
+IMAGE="${KERNEL_DIR}/out/arch/arm64/boot/Image.gz"
 TANGGAL=$(date +"%Y%m%d-%H")
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 PATH="${KERNEL_DIR}/clang/bin:${KERNEL_DIR}/gcc/bin:${KERNEL_DIR}/gcc32/bin:${PATH}"
@@ -41,7 +41,7 @@ modules_install
 # Zipping
 zipping() {
     cd AnyKernel || exit 1
-    cp ../out/arch/arm64/boot/Image.gz-dtb .
+    cp ../out/arch/arm64/boot/Image.gz .
     zip -r9 Styx-2e-BETA-${TANGGAL}.zip *
     cd ..
 }
