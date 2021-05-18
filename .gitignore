@@ -142,3 +142,8 @@ kernel/configs/android-*.cfg
         gcc/
         gcc32/
         out/
+/out/
+/AnyKernel
+/clang/
+/gcc/
+/gcc32
