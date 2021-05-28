@@ -177,7 +177,7 @@ static struct uac2_input_terminal_descriptor io_in_it_desc = {
 
 	.bDescriptorSubtype = UAC_INPUT_TERMINAL,
 	.bTerminalID = IO_IN_IT_ID,
-	.wTerminalType = cpu_to_le16(UAC_INPUT_TERMINAL_UNDEFINED),
+	.wTerminalType = cpu_to_le16(UAC_INPUT_TERMINAL_MICROPHONE),
 	.bAssocTerminal = 0,
 	.bCSourceID = USB_IN_CLK_ID,
 	.iChannelNames = 0,
@@ -205,7 +205,7 @@ static struct uac2_output_terminal_descriptor io_out_ot_desc = {
 
 	.bDescriptorSubtype = UAC_OUTPUT_TERMINAL,
 	.bTerminalID = IO_OUT_OT_ID,
-	.wTerminalType = cpu_to_le16(UAC_OUTPUT_TERMINAL_UNDEFINED),
+	.wTerminalType = cpu_to_le16(UAC_OUTPUT_TERMINAL_SPEAKER),
 	.bAssocTerminal = 0,
 	.bSourceID = USB_OUT_IT_ID,
 	.bCSourceID = USB_OUT_CLK_ID,
@@ -514,10 +514,12 @@ static void set_ep_max_packet_size(const struct f_uac2_opts *uac2_opts,
 		ssize = uac2_opts->c_ssize;
 	}
 
-	max_packet_size = num_channels(chmask) * ssize *
-		DIV_ROUND_UP(srate, factor / (1 << (ep_desc->bInterval - 1)));
-	ep_desc->wMaxPacketSize = cpu_to_le16(min_t(u16, max_packet_size,
-				le16_to_cpu(ep_desc->wMaxPacketSize)));
+	max_size_bw = num_channels(chmask) * ssize *
+		((srate / (factor / (1 << (ep_desc->bInterval - 1)))) + 1);
+	ep_desc->wMaxPacketSize = cpu_to_le16(min_t(u16, max_size_bw,
+						    max_size_ep));
+
+	return 0;
 }
 
 static int
@@ -629,7 +631,7 @@ afunc_bind(struct usb_configuration *cfg, struct usb_function *fn)
 	hs_epin_desc.bEndpointAddress = fs_epin_desc.bEndpointAddress;
 
 	ret = usb_assign_descriptors(fn, fs_audio_desc, hs_audio_desc,
-					ss_audio_desc, NULL);
+					ss_audio_desc, ss_audio_desc);
 	if (ret)
 		return ret;
 
